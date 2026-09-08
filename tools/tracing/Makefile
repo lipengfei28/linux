@@ -1,11 +1,22 @@
 # SPDX-License-Identifier: GPL-2.0
 include ../scripts/Makefile.include
 
+INSTALL ?= install
+BINDIR ?= /usr/bin
+PYTHON ?= python3
+
 all: latency rtla
+
+check:
+	$(PYTHON) -m unittest discover -s tests -v
 
 clean: latency_clean rtla_clean
 
-install: latency_install rtla_install
+install: latency_install rtla_install stackmap_install
+
+stackmap_install:
+	$(call QUIET_INSTALL,stackmap_dump.py)$(INSTALL) -D -m 755 stackmap_dump.py \
+		$(DESTDIR)$(BINDIR)/stackmap_dump.py
 
 latency:
 	$(call descend,latency)
@@ -25,5 +36,5 @@ rtla_install:
 rtla_clean:
 	$(call descend,rtla,clean)
 
-.PHONY: all install clean latency latency_install latency_clean \
-	rtla rtla_install rtla_clean
+.PHONY: all check install clean stackmap_install latency latency_install \
+	latency_clean rtla rtla_install rtla_clean

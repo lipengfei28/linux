@@ -1794,6 +1794,14 @@ Kernel parameters
 			can be changed at run time by the max_graph_depth file
 			in the tracefs tracing directory. default: 0 (no limit)
 
+	ftrace_stackmap_bits=<uint>
+			[FTRACE] Set the stackmap capacity to 2^N records.
+			default: 14. Values outside 10-18 are clamped with a
+			warning. On a 64-bit kernel the element pool takes
+			about 8 MiB at 14 and 130 MiB at 18, plus 0.5 MiB and
+			8 MiB for the hash table.
+			See Documentation/trace/ftrace-stackmap.rst.
+
 	fw_devlink=	[KNL,EARLY] Create device links between consumer and supplier
 			devices by scanning the firmware to infer the
 			consumer/supplier relationships. This feature is

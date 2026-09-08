@@ -435,6 +435,12 @@ config FTRACE_STACKMAP
 	  deduplicated when stackmap is enabled for their trace array. Stackmap
 	  is currently available only for the global trace array.
 
+	  Map capacity defaults to 2^14 records and can be changed with the
+	  ftrace_stackmap_bits= boot parameter. Values outside 10-18 are
+	  clamped with a warning. On a 64-bit kernel the element pool takes
+	  about 8 MiB at the default and 130 MiB at 18; the hash table adds
+	  0.5 MiB and 8 MiB.
+
 	  The deduplicated stacks are exported via:
 
 	    /sys/kernel/tracing/stack_map        text; write 0 to reset

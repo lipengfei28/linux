@@ -82,7 +82,29 @@ static DECLARE_WAIT_QUEUE_HEAD(stackmap_free_wq);
 static u64 stackmap_next_gen = 1;
 
 /* The table is 2x the preallocated element pool. */
-#define FTRACE_STACKMAP_BITS		14
+#define FTRACE_STACKMAP_BITS_MIN	10
+#define FTRACE_STACKMAP_BITS_MAX	18
+#define FTRACE_STACKMAP_BITS_DEFAULT	14
+
+static unsigned int stackmap_map_bits = FTRACE_STACKMAP_BITS_DEFAULT;
+static int __init stackmap_bits_setup(char *str)
+{
+	unsigned long val;
+
+	if (kstrtoul(str, 0, &val)) {
+		pr_warn("ftrace_stackmap_bits=%s is invalid, using %u\n",
+			str, stackmap_map_bits);
+		return 1;
+	}
+	if (val < FTRACE_STACKMAP_BITS_MIN || val > FTRACE_STACKMAP_BITS_MAX) {
+		val = clamp_val(val, FTRACE_STACKMAP_BITS_MIN,
+				FTRACE_STACKMAP_BITS_MAX);
+		pr_warn("ftrace_stackmap_bits is out of range, using %lu\n", val);
+	}
+	stackmap_map_bits = val;
+	return 1;
+}
+__setup("ftrace_stackmap_bits=", stackmap_bits_setup);
 
 /* --- Element pool --- */
 
@@ -113,11 +135,15 @@ static void ftrace_stackmap_destroy(struct ftrace_stackmap *smap)
 static struct ftrace_stackmap *ftrace_stackmap_create(struct trace_array *tr)
 {
 	struct ftrace_stackmap *smap;
-	unsigned int bits = FTRACE_STACKMAP_BITS;
+	unsigned int bits;
 
 	smap = kzalloc_obj(*smap, GFP_KERNEL);
 	if (!smap)
 		return ERR_PTR(-ENOMEM);
+
+	bits = clamp_val(stackmap_map_bits,
+			 FTRACE_STACKMAP_BITS_MIN,
+			 FTRACE_STACKMAP_BITS_MAX);
 
 	smap->tr = tr;
 	smap->map_bits = bits;

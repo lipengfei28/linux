@@ -1,0 +1,114 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0
+# description: ftrace - stackmap option is gated to the top-level trace instance
+# requires: stack_map options/stackmap instances
+
+# The 'stackmap' option is added to TOP_LEVEL_TRACE_FLAGS, matching the
+# convention used for global-only options like 'printk' and 'record-cmd'.
+# Verify that:
+# 1. The global instance exposes options/stackmap and the required
+#    stack_map node. stack_map_stat and stack_map_bin are auxiliary and
+#    may be absent if their tracefs creation failed.
+# 2. A newly created secondary instance under instances/ does NOT expose
+#    options/stackmap or any stack_map* nodes.
+
+fail() {
+    echo "FAIL: $1"
+    exit_fail
+}
+
+instance_token=$(cat /proc/sys/kernel/random/uuid 2>/dev/null) || {
+    echo "could not obtain a collision-resistant instance token"
+    exit_unresolved
+}
+[ -n "$instance_token" ] || exit_unresolved
+owned_instance=stackmap_gate_owned_${PID}_${instance_token}
+owned_dir=instances/$owned_instance
+foreign_instance=stackmap_gate_foreign_${PID}_${instance_token}
+foreign_dir=instances/$foreign_instance
+owned_created=0
+foreign_created=0
+
+remove_owned() {
+    if [ "$owned_created" -eq 1 ]; then
+        rmdir "$owned_dir" || return 1
+        owned_created=0
+    fi
+}
+
+cleanup() {
+    if [ "$owned_created" -eq 1 ]; then
+        rmdir "$owned_dir" 2>/dev/null || :
+    fi
+    if [ "$foreign_created" -eq 1 ]; then
+        rmdir "$foreign_dir" 2>/dev/null || :
+    fi
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
+# 1. Global instance must expose the option and required map node
+test -e options/stackmap || fail "options/stackmap missing on global instance"
+test -e stack_map        || fail "stack_map missing on global instance"
+
+# 2. Create a foreign sentinel and an owned secondary instance. Defer signal
+# exit across each mkdir and ownership assignment: cleanup must remove a path
+# only after this invocation has successfully created it.
+interrupted=0
+trap 'interrupted=1' HUP INT TERM
+create_rc=0
+if mkdir "$foreign_dir"; then
+    foreign_created=1
+else
+    create_rc=$?
+fi
+trap 'exit 1' HUP INT TERM
+[ "$interrupted" -eq 0 ] || exit 1
+[ "$create_rc" -eq 0 ] || fail "could not create foreign sentinel instance"
+
+interrupted=0
+trap 'interrupted=1' HUP INT TERM
+create_rc=0
+if mkdir "$owned_dir"; then
+    owned_created=1
+else
+    create_rc=$?
+fi
+trap 'exit 1' HUP INT TERM
+[ "$interrupted" -eq 0 ] || exit 1
+[ "$create_rc" -eq 0 ] || fail "could not create secondary instance"
+
+if [ -e "$owned_dir/options/stackmap" ]; then
+    fail "secondary instance unexpectedly exposes options/stackmap"
+fi
+
+for f in stack_map stack_map_stat stack_map_bin; do
+    if [ -e "$owned_dir/$f" ]; then
+        fail "secondary instance unexpectedly has $f"
+    fi
+done
+
+# 3. The aggregate trace_options file still reaches set_tracer_flag(),
+#    so writing 'stackmap' there must be rejected on a secondary
+#    instance. Otherwise the bit could appear set in trace_options
+#    while the hot path silently falls back to a full stack trace
+#    (tr->stackmap == NULL).
+if echo stackmap > "$owned_dir/trace_options" 2>/dev/null; then
+    fail "secondary instance accepted 'echo stackmap > trace_options'"
+fi
+if grep -qw stackmap "$owned_dir/trace_options"; then
+    fail "secondary instance trace_options reports stackmap as set"
+fi
+
+remove_owned || fail "could not remove owned secondary instance"
+if [ -e "$owned_dir" ]; then
+    fail "owned secondary instance still exists after removal"
+fi
+if [ ! -d "$foreign_dir" ]; then
+    fail "owned cleanup removed foreign sentinel instance"
+fi
+rmdir "$foreign_dir" || fail "could not remove foreign sentinel instance"
+foreign_created=0
+
+echo "stackmap option gating to top-level instance works"
+exit 0

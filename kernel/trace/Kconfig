@@ -438,6 +438,7 @@ config FTRACE_STACKMAP
 	  The deduplicated stacks are exported via:
 
 	    /sys/kernel/tracing/stack_map        text; write 0 to reset
+	    /sys/kernel/tracing/stack_map_stat   statistics
 
 	  Each stack_map record shows the stack_id, the generation and the
 	  number of hits since the last reset.

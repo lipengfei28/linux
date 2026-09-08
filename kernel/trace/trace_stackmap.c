@@ -24,6 +24,8 @@
 #include <linux/rcupdate.h>
 #include <linux/log2.h>
 #include <linux/refcount.h>
+#include <linux/math64.h>
+#include <linux/overflow.h>
 #include <asm/local.h>
 
 #include "trace.h"
@@ -562,4 +564,139 @@ const struct file_operations ftrace_stackmap_fops = {
 	.write		= stackmap_write,
 	.llseek		= seq_lseek,
 	.release	= stackmap_release,
+};
+
+/* --- Stats --- */
+
+static u64 stackmap_u64_add_sat(u64 left, u64 right)
+{
+	u64 sum;
+
+	return check_add_overflow(left, right, &sum) ? U64_MAX : sum;
+}
+
+static int stackmap_scaled_cmp(u64 left, u32 left_scale,
+			       u64 right, u32 right_scale)
+{
+	u64 left_hi = mul_u64_u64_shr(left, left_scale, 64);
+	u64 right_hi = mul_u64_u64_shr(right, right_scale, 64);
+	u64 left_lo = left * left_scale;
+	u64 right_lo = right * right_scale;
+
+	if (left_hi != right_hi)
+		return left_hi < right_hi ? -1 : 1;
+	if (left_lo != right_lo)
+		return left_lo < right_lo ? -1 : 1;
+	return 0;
+}
+
+static u64 stackmap_success_rate(u64 successes, u64 drops)
+{
+	u32 low = 0, high = 100;
+
+	if (!successes)
+		return 0;
+	if (!drops)
+		return 100;
+
+	/*
+	 * Find the largest percentage p satisfying
+	 *
+	 *   p * drops <= (100 - p) * successes
+	 *
+	 * which is equivalent to p <= 100 * successes / (successes + drops),
+	 * without forming the potentially 65-bit denominator. Compare the
+	 * products as 128-bit values split into high and low halves.
+	 */
+	while (low < high) {
+		u32 mid = (low + high + 1) / 2;
+
+		if (stackmap_scaled_cmp(drops, mid, successes, 100 - mid) <= 0)
+			low = mid;
+		else
+			high = mid - 1;
+	}
+
+	return low;
+}
+
+static int stackmap_stat_show(struct seq_file *m, void *v)
+{
+	struct ftrace_stackmap *smap = m->private;	/* pinned at open() */
+	u64 successes = 0, drops = 0;
+	u64 cpu_successes, cpu_drops;
+	u32 entries;
+	int cpu;
+
+	/*
+	 * Sample every counter under the read side of stackmap_rwsem. Reset
+	 * clears next_elt and the per-CPU counters under the write side,
+	 * so without this an unserialized read could straddle a reset and
+	 * report a mix of the two generations -- a non-zero entry count
+	 * next to counters that have already been zeroed, for instance.
+	 */
+	guard(rwsem_read)(&stackmap_rwsem);
+
+	if (!smap) {
+		seq_puts(m, "stackmap not allocated\n");
+		return 0;
+	}
+
+	entries = atomic_read(&smap->next_elt);
+	for_each_possible_cpu(cpu) {
+		cpu_successes = atomic_long_read(
+			per_cpu_ptr(smap->successes, cpu));
+		cpu_drops = atomic_long_read(per_cpu_ptr(smap->drops, cpu));
+		successes = stackmap_u64_add_sat(successes, cpu_successes);
+		drops = stackmap_u64_add_sat(drops, cpu_drops);
+	}
+
+	seq_printf(m, "entries:      %u / %u\n", entries, smap->max_elts);
+	seq_printf(m, "table_size:   %u\n", smap->map_size);
+	seq_printf(m, "successes:    %llu\n", successes);
+	seq_printf(m, "drops:        %llu\n", drops);
+	seq_printf(m, "success_rate: %llu%%\n",
+		   stackmap_success_rate(successes, drops));
+	return 0;
+}
+
+static int stackmap_stat_open(struct inode *inode, struct file *file)
+{
+	struct trace_array *tr = inode->i_private;
+	struct ftrace_stackmap *smap;
+	int ret;
+
+	/* Same open-time tracing policy as the other stackmap files. */
+	ret = tracing_check_open_get_tr(tr);
+	if (ret)
+		return ret;
+
+	smap = stackmap_get(tr);
+	ret = single_open(file, stackmap_stat_show, smap);
+	if (ret) {
+		stackmap_put(smap);
+		trace_array_put(tr);
+		return ret;
+	}
+	return 0;
+}
+
+static int stackmap_stat_release(struct inode *inode, struct file *file)
+{
+	struct seq_file *m = file->private_data;
+	struct ftrace_stackmap *smap = m->private;
+	struct trace_array *tr = inode->i_private;
+	int ret;
+
+	ret = single_release(inode, file);
+	stackmap_put(smap);
+	trace_array_put(tr);
+	return ret;
+}
+
+const struct file_operations ftrace_stackmap_stat_fops = {
+	.open		= stackmap_stat_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= stackmap_stat_release,
 };

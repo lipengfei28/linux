@@ -9314,6 +9314,11 @@ static __init void tracer_init_tracefs_work_func(struct work_struct *work)
 		pr_warn("ftrace stackmap init: stack_map create failed, dedup disabled\n");
 		stackmap_mark_init_failed();
 	} else {
+		/* Auxiliary nodes: warn, but stack_map alone is enough. */
+		if (!trace_create_file("stack_map_stat", TRACE_MODE_READ, NULL,
+				       &global_trace, &ftrace_stackmap_stat_fops))
+			pr_warn("ftrace stackmap: could not create stack_map_stat\n");
+
 		guard(mutex)(&trace_types_lock);
 		WRITE_ONCE(stackmap_init_state, STACKMAP_INIT_READY);
 		/* trace_options=stackmap on the command line. */

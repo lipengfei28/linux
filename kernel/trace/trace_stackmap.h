@@ -22,6 +22,7 @@ int ftrace_stackmap_get_cookie(struct ftrace_stackmap *smap,
 			       u64 *cookie);
 
 extern const struct file_operations ftrace_stackmap_fops;
+extern const struct file_operations ftrace_stackmap_stat_fops;
 
 #else
 

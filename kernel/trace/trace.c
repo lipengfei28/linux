@@ -9318,6 +9318,9 @@ static __init void tracer_init_tracefs_work_func(struct work_struct *work)
 		if (!trace_create_file("stack_map_stat", TRACE_MODE_READ, NULL,
 				       &global_trace, &ftrace_stackmap_stat_fops))
 			pr_warn("ftrace stackmap: could not create stack_map_stat\n");
+		if (!trace_create_file("stack_map_bin", TRACE_MODE_READ, NULL,
+				       &global_trace, &ftrace_stackmap_bin_fops))
+			pr_warn("ftrace stackmap: could not create stack_map_bin\n");
 
 		guard(mutex)(&trace_types_lock);
 		WRITE_ONCE(stackmap_init_state, STACKMAP_INIT_READY);

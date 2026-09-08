@@ -6,13 +6,15 @@
  * A 64-bit cookie combines the map generation with the hash-table slot.
  *
  * Reset clears only the map; it does not touch the ring buffer. An open
- * tracefs file holds a reference to the map it opened.
+ * tracefs file holds a reference to the map it opened, and binary readers
+ * check the generation between passes.
  *
  * The map is allocated when the stackmap option is first enabled and
  * released on request.
  */
 
 #include <linux/kernel.h>
+#include <linux/bitmap.h>
 #include <linux/slab.h>
 #include <linux/jhash.h>
 #include <linux/seq_file.h>
@@ -699,4 +701,239 @@ const struct file_operations ftrace_stackmap_stat_fops = {
 	.read		= seq_read,
 	.llseek		= seq_lseek,
 	.release	= stackmap_stat_release,
+};
+
+/* --- Binary export --- */
+
+/*
+ * Open snapshots slot membership and streams records without copying the
+ * element pool. A reset changes the generation; a reader that observes
+ * that change gets -ESTALE and must reopen. Records contain adjusted IPs.
+ */
+struct stackmap_bin_iter {
+	struct trace_array	*tr;
+	struct ftrace_stackmap	*smap;		/* pinned at open(), may be NULL */
+	u64			generation;	/* sampled at open(); 0: no map */
+	u32			map_size;	/* sampled at open() */
+	u32			nr_stacks;	/* selected at open() */
+	bool			locked;		/* stackmap_rwsem held by start() */
+	/* Keep the full-depth record off the seq_file stack. */
+	char			ebuf[sizeof(struct ftrace_stackmap_bin_entry) +
+				     FTRACE_STACKMAP_MAX_DEPTH * sizeof(u64)]
+				     __aligned(8);
+	unsigned long		*slots;
+};
+
+static struct stackmap_entry *stackmap_bin_seek(struct stackmap_bin_iter *iter,
+						loff_t *idx)
+{
+	unsigned long i;
+
+	i = find_next_bit(iter->slots, iter->map_size, *idx);
+	if (i >= iter->map_size) {
+		*idx = iter->map_size;
+		return NULL;
+	}
+
+	*idx = i;
+	return &iter->smap->entries[i];
+}
+
+/*
+ * Position 0 is the header; position idx + 1 is table slot idx. A file
+ * opened without a map holds only the header.
+ */
+static void *stackmap_bin_seq_start(struct seq_file *m, loff_t *pos)
+{
+	struct stackmap_bin_iter *iter = m->private;
+	struct stackmap_entry *entry;
+	loff_t idx;
+
+	down_read(&stackmap_rwsem);
+	iter->locked = true;
+
+	if (!iter->generation)
+		return *pos ? NULL : SEQ_START_TOKEN;
+
+	if (*pos > iter->map_size)
+		return NULL;
+
+	/* A reset since open() changes the generation. */
+	if (iter->smap->generation != iter->generation)
+		return ERR_PTR(-ESTALE);
+
+	if (*pos == 0)
+		return SEQ_START_TOKEN;
+
+	idx = *pos - 1;
+	entry = stackmap_bin_seek(iter, &idx);
+	*pos = idx + 1;
+	return entry;
+}
+
+static void *stackmap_bin_seq_next(struct seq_file *m, void *v, loff_t *pos)
+{
+	struct stackmap_bin_iter *iter = m->private;
+	struct stackmap_entry *entry;
+	loff_t idx;
+
+	if (!iter->generation) {
+		*pos = 1;
+		return NULL;
+	}
+
+	if (v == SEQ_START_TOKEN)
+		idx = 0;
+	else
+		idx = ((struct stackmap_entry *)v - iter->smap->entries) + 1;
+
+	entry = stackmap_bin_seek(iter, &idx);
+	*pos = idx + 1;
+	return entry;
+}
+
+static void stackmap_bin_seq_stop(struct seq_file *m, void *v)
+{
+	struct stackmap_bin_iter *iter = m->private;
+
+	/* seq_file calls stop() even when start() returned NULL. */
+	if (iter->locked) {
+		up_read(&stackmap_rwsem);
+		iter->locked = false;
+	}
+}
+
+static int stackmap_bin_seq_show(struct seq_file *m, void *v)
+{
+	struct stackmap_bin_iter *iter = m->private;
+	struct ftrace_stackmap_bin_entry *e;
+	struct stackmap_entry *entry;
+	struct stackmap_elt *elt;
+	u32 i, nr;
+
+	if (v == SEQ_START_TOKEN) {
+		struct ftrace_stackmap_bin_header hdr = {
+			.magic		= FTRACE_STACKMAP_BIN_MAGIC,
+			.version	= FTRACE_STACKMAP_BIN_VERSION,
+			.nr_stacks	= iter->nr_stacks,
+			/* Sampled at open(), not the current generation. */
+			.generation	= (u32)iter->generation,
+		};
+
+		seq_write(m, &hdr, sizeof(hdr));
+		return 0;
+	}
+
+	entry = v;
+	elt = stackmap_load_elt(entry);
+	if (!elt)
+		return 0;
+
+	nr = READ_ONCE(elt->nr);
+	if (nr > FTRACE_STACKMAP_MAX_DEPTH)
+		nr = FTRACE_STACKMAP_MAX_DEPTH;
+
+	e = (struct ftrace_stackmap_bin_entry *)iter->ebuf;
+	e->stack_id = entry - iter->smap->entries;
+	e->nr = nr;
+	e->ref_count = atomic_read(&elt->ref_count);
+	e->reserved = 0;
+
+	for (i = 0; i < nr; i++) {
+		unsigned long ip = elt->ips[i];
+
+		if (ip == FTRACE_TRAMPOLINE_MARKER)
+			e->ips[i] = (u64)FTRACE_TRAMPOLINE_MARKER;
+		else
+			e->ips[i] = (u64)trace_adjust_address(iter->tr, ip);
+	}
+
+	seq_write(m, e, struct_size(e, ips, nr));
+	return 0;
+}
+
+static const struct seq_operations stackmap_bin_seq_ops = {
+	.start	= stackmap_bin_seq_start,
+	.next	= stackmap_bin_seq_next,
+	.stop	= stackmap_bin_seq_stop,
+	.show	= stackmap_bin_seq_show,
+};
+
+static int stackmap_bin_open(struct inode *inode, struct file *file)
+{
+	struct trace_array *tr = inode->i_private;
+	struct ftrace_stackmap *smap;
+	struct stackmap_bin_iter *iter;
+	struct seq_file *m;
+	u32 nr = 0;
+	loff_t i;
+	int ret;
+
+	ret = tracing_check_open_get_tr(tr);
+	if (ret)
+		return ret;
+
+	ret = seq_open_private(file, &stackmap_bin_seq_ops, sizeof(*iter));
+	if (ret)
+		goto put_tr;
+
+	m = file->private_data;
+	iter = m->private;
+	iter->tr = tr;
+
+	/* Fix membership and nr_stacks at open; later inserts are excluded. */
+	smap = stackmap_get(tr);
+	iter->smap = smap;
+	down_read(&stackmap_rwsem);
+	if (smap) {
+		iter->slots = kvcalloc(BITS_TO_LONGS(smap->map_size),
+				       sizeof(*iter->slots), GFP_KERNEL_ACCOUNT);
+		if (!iter->slots) {
+			up_read(&stackmap_rwsem);
+			ret = -ENOMEM;
+			goto release_seq;
+		}
+		iter->generation = smap->generation;
+		iter->map_size = smap->map_size;
+		for (i = 0; i < smap->map_size; i++) {
+			if (READ_ONCE(smap->entries[i].key) &&
+			    stackmap_load_elt(&smap->entries[i])) {
+				__set_bit(i, iter->slots);
+				nr++;
+			}
+		}
+	}
+	up_read(&stackmap_rwsem);
+
+	iter->nr_stacks = nr;
+	return 0;
+
+release_seq:
+	stackmap_put(smap);
+	seq_release_private(inode, file);
+put_tr:
+	trace_array_put(tr);
+	return ret;
+}
+
+static int stackmap_bin_release(struct inode *inode, struct file *file)
+{
+	struct seq_file *m = file->private_data;
+	struct stackmap_bin_iter *iter = m->private;
+	struct ftrace_stackmap *smap = iter->smap;
+	struct trace_array *tr = iter->tr;
+	int ret;
+
+	kvfree(iter->slots);
+	ret = seq_release_private(inode, file);
+	stackmap_put(smap);
+	trace_array_put(tr);
+	return ret;
+}
+
+const struct file_operations ftrace_stackmap_bin_fops = {
+	.open		= stackmap_bin_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= stackmap_bin_release,
 };

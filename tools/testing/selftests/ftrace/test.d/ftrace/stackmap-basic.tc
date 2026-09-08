@@ -1,0 +1,250 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0
+# description: ftrace - stackmap basic functionality
+# requires: stack_map stack_map_stat options/stackmap options/stacktrace events/sched/sched_switch/enable
+
+# Test that ftrace stackmap deduplication works:
+# 1. Enable stackmap and stack capture for sched_switch events
+# 2. Run a scheduling workload briefly
+# 3. Verify trace contains <stack_id> events
+# 4. Verify stack_map has entries and at least some successes. Drops are
+#    a legitimate by-design fallback counter and may be nonzero.
+# 5. Verify reset succeeds while tracing is active (it clears the map
+#    only and leaves the ring buffer alone)
+# 6. Verify reset also clears the map when tracing is stopped
+
+fail() {
+    echo "FAIL: $1"
+    exit_fail
+}
+
+wait_for_worker_stopped() {
+    tries=0
+    while [ "$tries" -lt 100 ]; do
+        state=
+        if state=$(awk '/^State:/ { print $2 }' "/proc/$worker/status" \
+                2>/dev/null); then
+            case "$state" in
+            T|t)
+                return 0
+                ;;
+            esac
+        else
+            return 1
+        fi
+        sleep 0.01
+        tries=$((tries + 1))
+    done
+    return 1
+}
+
+worker=
+
+cleanup() {
+    disable_tracing 2>/dev/null || :
+    if [ -n "$worker" ]; then
+        kill -CONT "$worker" 2>/dev/null || :
+        kill "$worker" 2>/dev/null || :
+        wait "$worker" 2>/dev/null || :
+    fi
+    echo 0 > events/sched/sched_switch/filter 2>/dev/null || :
+    echo 0 > events/sched/sched_switch/enable 2>/dev/null || :
+    echo 0 > options/stackmap 2>/dev/null || :
+    echo 0 > options/stacktrace 2>/dev/null || :
+    echo 0 > stack_map 2>/dev/null || :
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
+disable_tracing
+clear_trace
+echo 0 > stack_map || fail "initial stackmap reset failed"
+
+# sched_switch gives a bounded, inexpensive writer path through
+# __ftrace_trace_stack(), unlike full function tracing under QEMU.
+echo 1 > options/stackmap
+echo 1 > options/stacktrace
+echo 1 > events/sched/sched_switch/enable
+
+# Keep a directly owned workload that blocks and wakes up in a loop. A busy
+# loop alone on an otherwise idle CPU is rarely switched out.
+(while :; do sleep 0.01; done) &
+worker=$!
+echo "prev_pid == $worker || next_pid == $worker" > \
+    events/sched/sched_switch/filter || fail "could not filter sched_switch workload"
+
+enable_tracing
+sleep 1
+
+# Lock in the precondition that makes this an active-writer reset test.
+[ "$(cat events/sched/sched_switch/enable)" = "1" ] ||
+    fail "sched_switch event is not enabled before reset"
+[ "$(cat options/stackmap)" = "1" ] ||
+    fail "stackmap option is not enabled before reset"
+[ "$(cat options/stacktrace)" = "1" ] ||
+    fail "stacktrace option is not enabled before reset"
+[ "$(cat tracing_on)" = "1" ] ||
+    fail "tracing is not on before reset"
+kill -0 "$worker" 2>/dev/null || fail "reset workload exited early"
+
+# Reset repeatedly while the owned writer is active, then again once it is
+# quiesced. Only deterministic properties are asserted:
+#
+#   - While the writer runs, the reset must be accepted. No counter is
+#     compared here: the writer resumes claiming records as soon as reset()
+#     returns, so any snapshot taken afterwards is a moving target and would
+#     make this test flaky rather than prove anything.
+#   - With the writer stopped, sched_switch filtered to it, and tracing off,
+#     no stackmap writer remains, so the following reset must leave exactly
+#     zero entries and zero successes. That is checked every iteration.
+#
+# That an active reset really starts a new generation is proven separately and
+# deterministically in stackmap-reset.tc, where a binary fd held across the
+# reset must observe its own generation and then ESTALE.
+i=0
+while [ "$i" -lt 5 ]; do
+    tries=0
+    pre_successes=0
+    # Up to 10 s: slow or loaded machines may need far longer than usual.
+    while [ "$tries" -lt 1000 ]; do
+        pre_successes=$(awk '/^successes:/ { print $2 }' stack_map_stat)
+        : "${pre_successes:=0}"
+        [ "$pre_successes" -ge 8 ] && break
+        sleep 0.01
+        tries=$((tries + 1))
+    done
+    [ "$pre_successes" -ge 8 ] ||
+        fail "active writer did not reach 8 successes before reset (got $pre_successes)"
+
+    echo 0 > stack_map || fail "stackmap reset failed with active writer"
+
+    kill -STOP "$worker" || fail "could not stop reset workload"
+    wait_for_worker_stopped ||
+        fail "reset workload did not enter the stopped state"
+    disable_tracing
+
+    echo 0 > stack_map || fail "stopped-writer verification reset failed"
+    reset_entries=$(awk '/^entries:/ { print $2 }' stack_map_stat)
+    : "${reset_entries:=-1}"
+    [ "$reset_entries" -eq 0 ] ||
+        fail "stopped-writer reset left $reset_entries entries"
+    reset_successes=$(awk '/^successes:/ { print $2 }' stack_map_stat)
+    : "${reset_successes:=-1}"
+    [ "$reset_successes" -eq 0 ] ||
+        fail "stopped-writer reset left successes=$reset_successes"
+
+    kill -CONT "$worker" || fail "could not resume reset workload"
+    enable_tracing
+    i=$((i + 1))
+done
+
+# Reset intentionally leaves the ring buffer untouched. Drop those old ids
+# here so every id inspected below belongs to the final map generation.
+clear_trace
+
+# Wait until aggregate counters prove that at least one operation reused an
+# existing element record: every insertion increments both entries and
+# successes, while a hit increments successes only. Stop the worker before
+# taking the decisive sample so both the counters and ring buffer are stable.
+entries_after_active_reset=0
+successes_after_active_reset=0
+i=0
+while [ "$i" -lt 100 ]; do
+    stats=$(cat stack_map_stat)
+    entries_after_active_reset=$(printf '%s\n' "$stats" |
+        awk '/^entries:/ { print $2 }')
+    successes_after_active_reset=$(printf '%s\n' "$stats" |
+        awk '/^successes:/ { print $2 }')
+    : "${entries_after_active_reset:=0}"
+    : "${successes_after_active_reset:=0}"
+    if [ "$entries_after_active_reset" -gt 0 ] &&
+       [ "$successes_after_active_reset" -gt \
+         "$entries_after_active_reset" ]; then
+        break
+    fi
+    sleep 0.1
+    i=$((i + 1))
+done
+
+kill -STOP "$worker" || fail "could not stop final reset workload"
+wait_for_worker_stopped ||
+    fail "final reset workload did not enter the stopped state"
+disable_tracing
+
+stats=$(cat stack_map_stat)
+entries_after_active_reset=$(printf '%s\n' "$stats" |
+    awk '/^entries:/ { print $2 }')
+successes_after_active_reset=$(printf '%s\n' "$stats" |
+    awk '/^successes:/ { print $2 }')
+: "${entries_after_active_reset:=0}"
+: "${successes_after_active_reset:=0}"
+if [ "$entries_after_active_reset" -eq 0 ]; then
+    fail "stackmap did not refill after active-writer reset"
+fi
+if [ "$successes_after_active_reset" -le "$entries_after_active_reset" ]; then
+    e=$entries_after_active_reset
+    s=$successes_after_active_reset
+    fail "no element-record reuse after reset (entries=$e successes=$s)"
+fi
+
+kill -CONT "$worker" 2>/dev/null || :
+kill "$worker" 2>/dev/null || :
+wait "$worker" 2>/dev/null || :
+worker=
+
+# Stop the event before inspecting the fixed buffer and map contents.
+echo 0 > events/sched/sched_switch/enable
+trace_pairs=$(sed -n \
+    's/.*<stack_id \([0-9][0-9]*\) gen \([0-9][0-9]*\)>.*/\1:\2/p' \
+    trace | sort -u)
+if [ -z "$trace_pairs" ]; then
+    fail "trace has no <stack_id N gen G> events after active-writer reset"
+fi
+
+echo 0 > options/stackmap
+
+# Check stack_map_stat
+entries=$(grep "^entries:" stack_map_stat | awk '{print $2}')
+: "${entries:=0}"
+if [ "$entries" -eq 0 ]; then
+    fail "stackmap has zero entries after active-writer reset"
+fi
+
+successes=$(grep "^successes:" stack_map_stat | awk '{print $2}')
+: "${successes:=0}"
+if [ "$successes" -eq 0 ]; then
+    fail "stackmap has zero successes"
+fi
+
+drops=$(grep "^drops:" stack_map_stat | awk '{print $2}')
+: "${drops:=0}"
+# drops is a legitimate by-design fallback counter: when the map is full
+# or under heavy probe pressure, stackmap falls back to recording a full
+# stack instead of a stack_id. A nonzero drops count is therefore allowed
+# as long as deduplication also produced successful stack_id events.
+
+# Every observed cookie was emitted after the final reset, so both its id
+# and its generation must match a current stack_map record.
+for pair in $trace_pairs; do
+    id=${pair%%:*}
+    gen=${pair##*:}
+    grep -q "^stack_id $id gen $gen " stack_map ||
+        fail "trace cookie id $id gen $gen has no current stack_map record"
+done
+
+# Check stack_map text output is parseable
+first_id=$(grep "^stack_id" stack_map | head -1 | awk '{print $2}')
+if [ -z "$first_id" ]; then
+    fail "stack_map output has no stack_id entries"
+fi
+
+# Test reset works when tracing is stopped as well
+echo 0 > stack_map
+entries_after=$(cat stack_map_stat | grep "^entries:" | awk '{print $2}')
+: "${entries_after:=-1}"
+if [ "$entries_after" -ne 0 ]; then
+    fail "stackmap reset did not clear entries (got $entries_after)"
+fi
+
+echo "stackmap basic test passed: $entries element records, $successes successes, $drops drops"
+exit 0

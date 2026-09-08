@@ -1,0 +1,227 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0
+# description: ftrace - stackmap reset ABI and binary generation handling
+# requires: stack_map stack_map_stat stack_map_bin options/stackmap options/stacktrace events/sched/sched_switch/enable od:program
+
+# Check reset, binary format, and old-fd generation behavior:
+# 1. Reset clears the map and leaves existing trace records intact.
+# 2. The binary header contains magic 'FSMB', version 1 and a generation
+#    that advances across a reset.
+# 3. After reset, an old fd returns only its buffered generation: either
+#    the exact remaining export and EOF, or buffered bytes then ESTALE.
+#    Reopening after reset yields an empty 16-byte export.
+# 4. free is refused while the option is enabled; after disabling, free
+#    releases the map and the next map continues the generation.
+
+fail() {
+    echo "FAIL: $1"
+    exit_fail
+}
+
+BIN_TEST=${FTRACETEST_ROOT}/stackmap_bin_test
+if [ ! -x "$BIN_TEST" ]; then
+    echo "stackmap_bin_test program is not compiled!"
+    exit_unresolved
+fi
+"$BIN_TEST" --selftest || fail "stack_map_bin helper selftest failed"
+
+worker=
+
+cleanup() {
+    disable_tracing 2>/dev/null || :
+    if [ -n "$worker" ]; then
+        kill "$worker" 2>/dev/null || :
+        wait "$worker" 2>/dev/null || :
+    fi
+    echo 0 > events/sched/sched_switch/enable 2>/dev/null || :
+    echo 0 > options/stackmap 2>/dev/null || :
+    echo 0 > options/stacktrace 2>/dev/null || :
+    echo 0 > stack_map 2>/dev/null || :
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
+disable_tracing
+clear_trace
+echo 0 > stack_map || fail "initial stackmap reset failed"
+
+# Use sched_switch as a bounded, inexpensive writer through
+# __ftrace_trace_stack(). Full function tracing with per-function stacks is
+# prohibitively slow in small QEMU guests and is not required here.
+echo 1 > options/stackmap
+echo 1 > options/stacktrace
+echo 1 > events/sched/sched_switch/enable
+
+# Keep an owned task runnable for both this capture and the helper's later
+# open-time membership refill; do not depend on incidental host activity.
+(while :; do :; done) &
+worker=$!
+
+enable_tracing
+sleep 1
+disable_tracing
+
+# Sanity: the buffer must contain stack_id events before reset, otherwise
+# the buffer-untouched check below would be meaningless.
+before=$(grep -c "<stack_id" trace || true)
+: "${before:=0}"
+if [ "$before" -eq 0 ]; then
+    fail "no <stack_id> events captured before reset"
+fi
+
+# Validate a non-empty binary export before reset. od -tu4 uses the
+# target's native byte order, matching the kernel ABI on any endianness.
+magic=$(od -An -tx4 -N4 stack_map_bin | tr -d ' \n')
+[ "$magic" = "46534d42" ] ||
+    fail "stack_map_bin bad magic: 0x$magic (expected 46534d42)"
+ver=$(od -An -tu4 -j4 -N4 stack_map_bin | tr -d ' \n')
+[ "$ver" = "1" ] || fail "stack_map_bin version is $ver (expected 1)"
+# Header word 3 is the generation this dump was taken from. It starts at
+# 1 and every reset bumps it, so it is never 0 on a live map.
+bin_gen=$(od -An -tu4 -j12 -N4 stack_map_bin | tr -d ' \n')
+: "${bin_gen:=0}"
+[ "$bin_gen" -gt 0 ] ||
+    fail "stack_map_bin generation is $bin_gen (expected nonzero)"
+nr_stacks=$(od -An -tu4 -j8 -N4 stack_map_bin | tr -d ' \n')
+: "${nr_stacks:=0}"
+[ "$nr_stacks" -gt 0 ] || fail "stack_map_bin has zero stacks before reset"
+first_nr=$(od -An -tu4 -j20 -N4 stack_map_bin | tr -d ' \n')
+: "${first_nr:=0}"
+if [ "$first_nr" -lt 1 ] || [ "$first_nr" -gt 64 ]; then
+    fail "first binary entry has invalid depth $first_nr"
+fi
+first_refs=$(od -An -tu4 -j24 -N4 stack_map_bin | tr -d ' \n')
+: "${first_refs:=0}"
+[ "$first_refs" -gt 0 ] || fail "first binary entry has zero ref_count"
+binary_bytes=$(wc -c < stack_map_bin)
+minimum_bytes=$((32 + first_nr * 8))
+if [ "$binary_bytes" -lt "$minimum_bytes" ]; then
+    fail "first binary entry is truncated: $binary_bytes < $minimum_bytes bytes"
+fi
+# Walk every record: the export must end right after the last one.
+od -An -tu4 -v stack_map_bin | awk '
+    { for (i = 1; i <= NF; i++) w[n++] = $i }
+    END {
+        off = 4
+        for (r = 0; r < w[2]; r++) {
+            nr = w[off + 1]
+            if (nr < 1 || nr > 64 || !w[off + 2] || w[off + 3]) exit 1
+            off += 4 + nr * 2
+        }
+        exit off != n
+    }' || fail "stack_map_bin records do not match the header"
+
+# Keep one binary fd open across reset, and require the stale-iterator path.
+#
+# The helper reads one byte, resets the map through a second fd, then drains
+# the first fd. A one-byte read cannot buffer the whole export: seq_read_iter()
+# stops filling once the buffered amount satisfies the request, and the binary
+# show() emits the 16-byte header as a record of its own. The old fd therefore
+# still has to start a new seq pass to continue, which is where the generation
+# is rechecked, so the drain must end in ESTALE at a strict prefix rather than
+# at EOF. Requiring that line keeps a regression from silently downgrading to
+# the fully buffered case and never exercising the check at all.
+bin_out=$("$BIN_TEST" stack_map_bin stack_map tracing_on)
+ret=$?
+printf '%s\n' "$bin_out"
+[ "$ret" -eq 0 ] || fail "stack_map_bin generation test failed (ret=$ret)"
+case "$bin_out" in
+*"old fd stopped at snapshot prefix"*) ;;
+*) fail "old binary fd did not reach the cross-pass ESTALE check" ;;
+esac
+
+# The helper refills the map for its membership check. Save the actual
+# stack-id records before the stopped reset below; comparing only their count
+# would miss replacement, reordering, or content corruption.
+before_records=$(grep "<stack_id" trace || true)
+if [ -z "$before_records" ]; then
+    fail "no <stack_id> records remain before stopped reset"
+fi
+
+# Reset clears the map only. It must succeed and must not disturb the
+# trace buffer.
+echo 0 > stack_map || fail "reset failed"
+
+after_records=$(grep "<stack_id" trace || true)
+if [ "$after_records" != "$before_records" ]; then
+    fail "reset changed the trace buffer records"
+fi
+before=$(printf '%s\n' "$before_records" | wc -l)
+
+entries=$(cat stack_map_stat | grep "^entries:" | awk '{print $2}')
+: "${entries:=-1}"
+if [ "$entries" -ne 0 ]; then
+    fail "stackmap still has $entries entries after reset"
+fi
+
+successes=$(grep "^successes:" stack_map_stat | awk '{print $2}')
+: "${successes:=-1}"
+if [ "$successes" -ne 0 ]; then
+    fail "reset left successes=$successes (expected 0)"
+fi
+
+drops=$(grep "^drops:" stack_map_stat | awk '{print $2}')
+: "${drops:=-1}"
+if [ "$drops" -ne 0 ]; then
+    fail "reset left drops=$drops (expected 0)"
+fi
+
+rate=$(cat stack_map_stat | grep "^success_rate:" | awk '{print $2}')
+if [ "$rate" != "0%" ]; then
+    fail "stackmap reset success_rate is '$rate' (expected 0%)"
+fi
+
+# Binary export header: magic 'FSMB' (0x46534D42) + version 1.
+# od -tx4 uses the target's native byte order, matching the kernel ABI.
+magic=$(od -An -tx4 -N4 stack_map_bin | tr -d ' \n')
+if [ "$magic" != "46534d42" ]; then
+    fail "stack_map_bin bad magic: 0x$magic (expected 46534d42)"
+fi
+ver=$(od -An -tx4 -j4 -N4 stack_map_bin | tr -d ' \n')
+if [ "$ver" != "00000001" ]; then
+    fail "stack_map_bin bad version: 0x$ver (expected 00000001)"
+fi
+# The map was reset since the dump above, so this generation must differ.
+post_gen=$(od -An -tu4 -j12 -N4 stack_map_bin | tr -d ' \n')
+: "${post_gen:=0}"
+if [ "$post_gen" -le "$bin_gen" ]; then
+    fail "generation did not advance across reset: $bin_gen -> $post_gen"
+fi
+nr_stacks=$(od -An -tu4 -j8 -N4 stack_map_bin | tr -d ' \n')
+: "${nr_stacks:=-1}"
+if [ "$nr_stacks" -ne 0 ]; then
+    fail "stack_map_bin has $nr_stacks stacks after reset"
+fi
+binary_bytes=$(wc -c < stack_map_bin)
+if [ "$binary_bytes" -ne 16 ]; then
+    fail "empty stack_map_bin is $binary_bytes bytes (expected 16)"
+fi
+
+# free is refused while the option is enabled.
+if echo free > stack_map 2>/dev/null; then
+    fail "free accepted while options/stackmap is enabled"
+fi
+
+# Disabling keeps the map; free releases it.
+echo 0 > options/stackmap
+grep -q '^table_size:' stack_map_stat ||
+    fail "map released by disabling the option"
+echo free > stack_map || fail "free failed with the option disabled"
+grep -q 'not allocated' stack_map_stat ||
+    fail "stack_map_stat still reports a map after free"
+free_gen=$(od -An -tu4 -j12 -N4 stack_map_bin | tr -d ' \n')
+binary_bytes=$(wc -c < stack_map_bin)
+if [ "$free_gen" != "0" ] || [ "$binary_bytes" -ne 16 ]; then
+    fail "stack_map_bin without a map: gen=$free_gen size=$binary_bytes"
+fi
+
+# Re-enabling allocates a map that continues the generation.
+echo 1 > options/stackmap
+new_gen=$(od -An -tu4 -j12 -N4 stack_map_bin | tr -d ' \n')
+: "${new_gen:=0}"
+if [ "$new_gen" -ne $((post_gen + 1)) ]; then
+    fail "generation after free and re-enable is $new_gen (expected $((post_gen + 1)))"
+fi
+
+echo "stackmap reset test passed: map cleared, $before stack_id events kept, ABI header ok"
+exit 0

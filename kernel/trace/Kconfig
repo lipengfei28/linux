@@ -412,6 +412,23 @@ config STACK_TRACER
 
 	  Say N if unsure.
 
+config FTRACE_STACKMAP
+	bool "Ftrace stack map deduplication"
+	depends on TRACING
+	depends on STACKTRACE
+	depends on ARCH_HAVE_NMI_SAFE_CMPXCHG
+	select KALLSYMS
+	select TASKS_RUDE_RCU
+	help
+	  Build a lock-free hash table that deduplicates ftrace stack
+	  traces, inspired by eBPF's BPF_MAP_TYPE_STACK_TRACE. Each distinct
+	  stack is stored once in the table, so the ring buffer can record a
+	  64-bit cookie instead of the full stack trace when the same call
+	  stacks appear repeatedly.
+
+	  Say Y if you want to reduce ftrace buffer usage for stack traces.
+	  Say N if unsure.
+
 config TRACE_PREEMPT_TOGGLE
 	bool
 	help

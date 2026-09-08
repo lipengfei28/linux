@@ -57,6 +57,7 @@
 
 #include "trace.h"
 #include "trace_output.h"
+#include "trace_stackmap.h"
 
 #ifdef CONFIG_FTRACE_STARTUP_TEST
 /*
@@ -509,12 +510,13 @@ EXPORT_SYMBOL_GPL(unregister_ftrace_export);
 /* trace_options that are only supported by global_trace */
 #define TOP_LEVEL_TRACE_FLAGS (TRACE_ITER(PRINTK) |			\
 	       TRACE_ITER(PRINTK_MSGONLY) | TRACE_ITER(RECORD_CMD) |	\
-	       TRACE_ITER(PROF_TEXT_OFFSET) | FPROFILE_DEFAULT_FLAGS)
+	       TRACE_ITER(PROF_TEXT_OFFSET) | TRACE_ITER(STACKMAP) |	\
+	       FPROFILE_DEFAULT_FLAGS)
 
 /* trace_flags that are default zero for instances */
 #define ZEROED_TRACE_FLAGS \
 	(TRACE_ITER(EVENT_FORK) | TRACE_ITER(FUNC_FORK) | TRACE_ITER(TRACE_PRINTK) | \
-	 TRACE_ITER(COPY_MARKER))
+	 TRACE_ITER(COPY_MARKER) | TRACE_ITER(STACKMAP))
 
 /*
  * The global_trace is the descriptor that holds the top-level tracing
@@ -2182,6 +2184,49 @@ void __ftrace_trace_stack(struct trace_array *tr,
 				calls[i] = FTRACE_TRAMPOLINE_MARKER;
 		}
 	}
+#endif
+
+#ifdef CONFIG_FTRACE_STACKMAP
+	/*
+	 * Reserve the cookie event before updating the map. On failure, use
+	 * the full-stack fallback.
+	 */
+	if (tr->trace_flags & TRACE_ITER(STACKMAP)) {
+		struct ftrace_stackmap *smap;
+		struct stack_id_entry *sid_entry;
+		u64 cookie;
+
+		/*
+		 * Pairs with smp_store_release() in ftrace_stackmap_alloc().
+		 * Preemption is disabled from the load until the map is no
+		 * longer used, so the grace periods in stackmap_free() cover it.
+		 */
+		smap = smp_load_acquire(&tr->stackmap);
+		if (!smap)
+			goto full_stack;
+
+		/* Do not truncate deep stacks or merge them with a shorter prefix. */
+		if (nr_entries > FTRACE_STACKMAP_MAX_DEPTH)
+			goto full_stack;
+
+		event = __trace_buffer_lock_reserve(buffer, TRACE_STACK_ID,
+						    sizeof(*sid_entry), trace_ctx);
+		if (!event)
+			goto full_stack;
+
+		if (ftrace_stackmap_get_cookie(smap, fstack->calls, nr_entries,
+					       &cookie) < 0) {
+			__trace_event_discard_commit(buffer, event);
+			goto full_stack;
+		}
+
+		sid_entry = ring_buffer_event_data(event);
+		sid_entry->stack_cookie = cookie;
+		/* Side event of an already-filtered event; no filter of its own. */
+		__buffer_unlock_commit(buffer, event);
+		goto out;
+	}
+full_stack:
 #endif
 
 	event = __trace_buffer_lock_reserve(buffer, TRACE_STACK,
@@ -3976,6 +4021,25 @@ int trace_keep_overwrite(struct tracer *tracer, u64 mask, int set)
 	return 0;
 }
 
+#ifdef CONFIG_FTRACE_STACKMAP
+/* Boot-time options may precede tracefs initialization. */
+enum {
+	STACKMAP_INIT_PENDING,	/* tracer_init_tracefs() not run yet */
+	STACKMAP_INIT_READY,	/* stack_map file created; map allocated on enable */
+	STACKMAP_INIT_FAILED,	/* permanent failure, never available */
+};
+
+static int stackmap_init_state = STACKMAP_INIT_PENDING;
+
+/* Make a failed initialization permanent and clear any boot-time enable. */
+static void __init stackmap_mark_init_failed(void)
+{
+	guard(mutex)(&trace_types_lock);
+	WRITE_ONCE(stackmap_init_state, STACKMAP_INIT_FAILED);
+	global_trace.trace_flags &= ~TRACE_ITER(STACKMAP);
+}
+#endif
+
 int set_tracer_flag(struct trace_array *tr, u64 mask, int enabled)
 {
 	switch (mask) {
@@ -3989,6 +4053,17 @@ int set_tracer_flag(struct trace_array *tr, u64 mask, int enabled)
 	/* do nothing if flag is already set */
 	if (!!(tr->trace_flags & mask) == !!enabled)
 		return 0;
+
+#ifdef CONFIG_FTRACE_STACKMAP
+	/*
+	 * Only the global instance owns a stackmap. Allow it while
+	 * initialization is pending, but reject it after a permanent failure.
+	 */
+	if (mask == TRACE_ITER(STACKMAP) && enabled &&
+	    (tr != &global_trace ||
+	     READ_ONCE(stackmap_init_state) == STACKMAP_INIT_FAILED))
+		return -EINVAL;
+#endif
 
 	/* Give the tracer a chance to approve the change */
 	if (tr->current_trace->flag_changed)
@@ -4020,6 +4095,17 @@ int set_tracer_flag(struct trace_array *tr, u64 mask, int enabled)
 		/* update_marker_trace updates the tr->trace_flags */
 		return 0;
 	}
+
+#ifdef CONFIG_FTRACE_STACKMAP
+	/* Before tracefs is ready, the map is allocated by its init work. */
+	if (mask == TRACE_ITER(STACKMAP) && enabled &&
+	    READ_ONCE(stackmap_init_state) == STACKMAP_INIT_READY) {
+		int ret = ftrace_stackmap_alloc(tr);
+
+		if (ret)
+			return ret;
+	}
+#endif
 
 	if (enabled)
 		tr->trace_flags |= mask;
@@ -9222,6 +9308,22 @@ static __init void tracer_init_tracefs_work_func(struct work_struct *work)
 			NULL, &tracing_dyn_info_fops);
 #endif
 
+#ifdef CONFIG_FTRACE_STACKMAP
+	if (!trace_create_file("stack_map", TRACE_MODE_WRITE, NULL,
+			       &global_trace, &ftrace_stackmap_fops)) {
+		pr_warn("ftrace stackmap init: stack_map create failed, dedup disabled\n");
+		stackmap_mark_init_failed();
+	} else {
+		guard(mutex)(&trace_types_lock);
+		WRITE_ONCE(stackmap_init_state, STACKMAP_INIT_READY);
+		/* trace_options=stackmap on the command line. */
+		if ((global_trace.trace_flags & TRACE_ITER(STACKMAP)) &&
+		    ftrace_stackmap_alloc(&global_trace)) {
+			pr_warn("ftrace stackmap: allocation failed, stackmap disabled\n");
+			global_trace.trace_flags &= ~TRACE_ITER(STACKMAP);
+		}
+	}
+#endif
 	create_trace_instances(NULL);
 
 	update_tracer_options();
@@ -9234,8 +9336,13 @@ static __init int tracer_init_tracefs(void)
 	trace_access_lock_init();
 
 	ret = tracing_init_dentry();
-	if (ret)
+	if (ret) {
+#ifdef CONFIG_FTRACE_STACKMAP
+		/* No later path can create or publish the global stackmap. */
+		stackmap_mark_init_failed();
+#endif
 		return 0;
+	}
 
 	if (trace_init_wq) {
 		INIT_WORK(&tracerfs_init_work, tracer_init_tracefs_work_func);

@@ -426,6 +426,22 @@ config FTRACE_STACKMAP
 	  64-bit cookie instead of the full stack trace when the same call
 	  stacks appear repeatedly.
 
+	  Automatic per-event stack capture requires the stacktrace option:
+
+	    echo 1 > /sys/kernel/tracing/options/stacktrace
+	    echo 1 > /sys/kernel/tracing/options/stackmap
+
+	  Explicit stack records requested through tracing APIs are also
+	  deduplicated when stackmap is enabled for their trace array. Stackmap
+	  is currently available only for the global trace array.
+
+	  The deduplicated stacks are exported via:
+
+	    /sys/kernel/tracing/stack_map        text; write 0 to reset
+
+	  Each stack_map record shows the stack_id, the generation and the
+	  number of hits since the last reset.
+
 	  Say Y if you want to reduce ftrace buffer usage for stack traces.
 	  Say N if unsure.
 

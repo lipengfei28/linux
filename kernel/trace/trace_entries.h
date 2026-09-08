@@ -250,6 +250,23 @@ FTRACE_ENTRY(user_stack, userstack_entry,
 		 (void *)__entry->caller[6], (void *)__entry->caller[7])
 );
 
+/* Stackmap cookie: generation in the high 32 bits, slot in the low 32. */
+#define STACK_COOKIE_GET_GEN(entry)	((u32)((entry)->stack_cookie >> 32))
+#define STACK_COOKIE_GET_ID(entry)	((u32)((entry)->stack_cookie))
+
+FTRACE_ENTRY(stack_id, stack_id_entry,
+
+	TRACE_STACK_ID,
+
+	F_STRUCT(
+		__field(	u64,		stack_cookie	)
+	),
+
+	F_printk("<stack_id %u gen %u>",
+		 STACK_COOKIE_GET_ID(__entry),
+		 STACK_COOKIE_GET_GEN(__entry))
+);
+
 /*
  * trace_printk entry:
  */

@@ -7,6 +7,9 @@
  *
  * Reset clears only the map; it does not touch the ring buffer. An open
  * tracefs file holds a reference to the map it opened.
+ *
+ * The map is allocated when the stackmap option is first enabled and
+ * released on request.
  */
 
 #include <linux/kernel.h>
@@ -67,6 +70,9 @@ struct ftrace_stackmap {
 
 /* Held for writing while map storage changes under tracefs readers. */
 static DECLARE_RWSEM(stackmap_rwsem);
+
+/* A free waits here for the files that still hold the map. */
+static DECLARE_WAIT_QUEUE_HEAD(stackmap_free_wq);
 
 /* Generation of the next map. Zero is reserved as an invalid generation. */
 static u64 stackmap_next_gen = 1;
@@ -195,6 +201,8 @@ static void stackmap_put(struct ftrace_stackmap *smap)
 		return;
 	if (refcount_dec_and_test(&smap->ref))
 		ftrace_stackmap_destroy(smap);
+	else
+		wake_up(&stackmap_free_wq);
 }
 
 /*
@@ -235,6 +243,36 @@ static void stackmap_reset(struct trace_array *tr)
 
 	/* Release resetting=0 so new get_cookie() observes a cleared map. */
 	atomic_set_release(&smap->resetting, 0);
+}
+
+/*
+ * Release the map. Refused while the option is enabled. Hot-path users
+ * are drained, then the free waits until every file that opened the map
+ * is closed. @self is the map held by the writing file, if any.
+ */
+static int stackmap_free(struct trace_array *tr, struct ftrace_stackmap *self)
+{
+	struct ftrace_stackmap *smap;
+	int ret;
+
+	scoped_guard(mutex, &trace_types_lock) {
+		if (tr->trace_flags & TRACE_ITER(STACKMAP))
+			return -EBUSY;
+		smap = tr->stackmap;
+		if (!smap)
+			return 0;
+
+		WRITE_ONCE(tr->stackmap, NULL);
+		stackmap_drain_users();
+		/* Continue the generation so old cookies do not match a new map. */
+		stackmap_next_gen = smap->generation + 1;
+	}
+
+	/* Closing a file calls trace_array_put(), so wait without the lock. */
+	ret = wait_event_killable(stackmap_free_wq,
+				  refcount_read(&smap->ref) == 1 + (self == smap));
+	stackmap_put(smap);
+	return ret;
 }
 
 /* --- Core: get_cookie (lock-free, NMI-safe) --- */
@@ -509,6 +547,8 @@ static ssize_t stackmap_write(struct file *file, const char __user *ubuf,
 	if (!strcmp(buf, "0") || !strcmp(buf, "reset")) {
 		guard(mutex)(&trace_types_lock);
 		stackmap_reset(priv->tr);
+	} else if (!strcmp(buf, "free")) {
+		ret = stackmap_free(priv->tr, priv->smap);
 	} else {
 		ret = -EINVAL;
 	}
